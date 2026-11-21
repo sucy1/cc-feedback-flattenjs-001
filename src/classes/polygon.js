@@ -16,9 +16,255 @@ import {
 } from "../data_structures/smart_intersections";
 import {Multiline} from "./multiline";
 import {intersectEdge2Edge} from "../algorithms/intersection";
+import * as BooleanOperations from "../algorithms/boolean_op";
 import {INSIDE, BOUNDARY, ORIENTATION} from "../utils/constants";
 import {convertToString} from "../utils/attributes";
 import {Matrix} from "./matrix";
+
+const OFFSET_JOINS = ["round", "miter", "bevel"];
+
+/**
+ * Return shape offset by delta along its left normal (delta < 0 offsets to the right).
+ * Segments are translated; arcs keep center and angles and change radius.
+ * Returns null when the shape collapses (arc radius shrinks to zero or less)
+ * @param {Segment|Arc} shape
+ * @param {number} delta
+ * @returns {Segment|Arc|null}
+ */
+function offsetEdgeShape(shape, delta) {
+    if (shape instanceof Flatten.Segment) {
+        let normal = shape.tangentInStart().rotate90CCW().multiply(delta);
+        return shape.translate(normal);
+    }
+    if (shape instanceof Flatten.Arc) {
+        /* For a CCW arc the left normal points to the center, for a CW arc away from it */
+        let newR = shape.counterClockwise ? shape.r - delta : shape.r + delta;
+        if (!(newR > 0)) {
+            return null;    // arc collapsed to its center
+        }
+        return new Flatten.Arc(shape.pc.clone(), newR, shape.startAngle, shape.endAngle, shape.counterClockwise);
+    }
+    return null;
+}
+
+/**
+ * Intersection point of the tangent line of shape1 at its end
+ * with the tangent line of shape2 at its start. Returns undefined if (near) parallel
+ */
+function tangentTrimPoint(shape1, shape2) {
+    /* tangentInEnd points from end to start: invert to get the direction of travel */
+    let t1 = shape1.tangentInEnd().invert();
+    let t2 = shape2.tangentInStart();
+    let cross = t1.cross(t2);
+    if (Flatten.Utils.EQ_0(cross)) {
+        return undefined;
+    }
+    let p1 = shape1.end;
+    let p2 = shape2.start;
+    let s = ((p2.x - p1.x) * t2.y - (p2.y - p1.y) * t2.x) / cross;
+    return new Flatten.Point(p1.x + s * t1.x, p1.y + s * t1.y);
+}
+
+/**
+ * Return copy of the shape with its end moved to pt (segment or arc)
+ */
+function setShapeEnd(shape, pt) {
+    if (shape instanceof Flatten.Segment) {
+        return new Flatten.Segment(shape.start, pt);
+    }
+    let endAngle = Math.atan2(pt.y - shape.pc.y, pt.x - shape.pc.x);
+    return new Flatten.Arc(shape.pc.clone(), shape.r, shape.startAngle, endAngle, shape.counterClockwise);
+}
+
+/**
+ * Return copy of the shape with its start moved to pt (segment or arc)
+ */
+function setShapeStart(shape, pt) {
+    if (shape instanceof Flatten.Segment) {
+        return new Flatten.Segment(pt, shape.end);
+    }
+    let startAngle = Math.atan2(pt.y - shape.pc.y, pt.x - shape.pc.x);
+    return new Flatten.Arc(shape.pc.clone(), shape.r, startAngle, shape.endAngle, shape.counterClockwise);
+}
+
+/**
+ * Points approximating the round join arc of radius r centered at vertex v,
+ * from p1 to p2, turning counterclockwise when ccw is true.
+ * Returns interior points only (p1 and p2 excluded).
+ * The join is approximated with at least `segments` chords per 90 degrees,
+ * and enough chords to keep chordal deviation within (PI/2 * r / segments) / 10
+ */
+function roundJoinPoints(v, p1, p2, r, ccw, segments) {
+    let a1 = Math.atan2(p1.y - v.y, p1.x - v.x);
+    let a2 = Math.atan2(p2.y - v.y, p2.x - v.x);
+    let sweep = ccw ? a2 - a1 : a1 - a2;
+    sweep = ((sweep % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+    if (Flatten.Utils.EQ_0(sweep)) {
+        return [];
+    }
+    let tolerance = (Math.PI / 2) / (10 * segments);    // chordal deviation tolerance / r
+    let maxStep = 2 * Math.acos(Math.max(-1, 1 - tolerance));
+    let k = Math.max(1, Math.ceil(segments * sweep / (Math.PI / 2)), Math.ceil(sweep / maxStep));
+    let points = [];
+    for (let j = 1; j < k; j++) {
+        let ang = ccw ? a1 + sweep * j / k : a1 - sweep * j / k;
+        points.push(new Flatten.Point(v.x + r * Math.cos(ang), v.y + r * Math.sin(ang)));
+    }
+    return points;
+}
+
+/**
+ * Build the offset shapes of the edges of a face, paired with the vertex
+ * that joins each shape to the next surviving one.
+ * delta is the signed displacement along the left normal of every edge
+ */
+function buildOffsetItems(face, delta) {
+    let edges = [...face];
+    let n = edges.length;
+    let offShapes = edges.map(edge => offsetEdgeShape(edge.shape, delta));
+
+    /* Collect surviving offset shapes and the vertex joining each to the next survivor */
+    let items = [];
+    for (let i = 0; i < n; i++) {
+        if (offShapes[i] === null) continue;
+        let joinVertex = edges[i].shape.end;
+        let j = (i + 1) % n;
+        while (offShapes[j] === null) {
+            /* Join across collapsed edges around the collapsed arc center */
+            joinVertex = edges[j].shape instanceof Flatten.Arc ? edges[j].shape.pc : edges[j].shape.end;
+            j = (j + 1) % n;
+        }
+        items.push({shape: offShapes[i], joinVertex});
+    }
+    return items;
+}
+
+/**
+ * Join offset items into a closed loop of shapes.
+ * Returns {shapes} with the loop, or {consumed} with the indices of offset edges
+ * eaten by trims from both sides (the offset collapsed across them)
+ */
+function buildLoopShapes(items, delta, join, miterLimit, segments) {
+    let m = items.length;
+
+    /* First pass: compute trims at reflex vertices and join shapes at convex vertices */
+    let endTrim = new Array(m).fill(undefined);
+    let startTrim = new Array(m).fill(undefined);
+    let joinShapes = new Array(m).fill(null).map(() => []);
+    for (let i = 0; i < m; i++) {
+        let cur = items[i].shape;
+        let next = items[(i + 1) % m].shape;
+        let v = items[i].joinVertex;
+        let p1 = cur.end;
+        let p2 = next.start;
+        if (p1.equalTo(p2)) continue;
+        let t1 = cur.tangentInEnd().invert();
+        let t2 = next.tangentInStart();
+        let cross = t1.cross(t2);
+        if (Flatten.Utils.EQ_0(cross)) {
+            joinShapes[i].push(new Flatten.Segment(p1, p2));
+            continue;
+        }
+        if (Math.sign(cross) === Math.sign(delta)) {
+            /* Reflex corner for this offset direction: trim offset shapes at their intersection */
+            let pt = tangentTrimPoint(cur, next);
+            if (pt === undefined) {
+                joinShapes[i].push(new Flatten.Segment(p1, p2));
+            } else {
+                endTrim[i] = pt;
+                startTrim[(i + 1) % m] = pt;
+            }
+            continue;
+        }
+        /* Convex corner: apply join type */
+        if (join === "round") {
+            let ccw = cross > 0;
+            let pts = roundJoinPoints(v, p1, p2, Math.abs(delta), ccw, segments);
+            let prev = p1;
+            for (let pt of [...pts, p2]) {
+                joinShapes[i].push(new Flatten.Segment(prev, pt));
+                prev = pt;
+            }
+        } else if (join === "miter") {
+            let pt = tangentTrimPoint(cur, next);
+            if (pt !== undefined && pt.distanceTo(v)[0] <= miterLimit * Math.abs(delta)) {
+                joinShapes[i].push(new Flatten.Segment(p1, pt), new Flatten.Segment(pt, p2));
+            } else {
+                joinShapes[i].push(new Flatten.Segment(p1, p2));    // miter limit exceeded: bevel
+            }
+        } else {    // bevel
+            joinShapes[i].push(new Flatten.Segment(p1, p2));
+        }
+    }
+
+    /* Second pass: instantiate trimmed shapes and joins into one loop */
+    let shapes = [];
+    let consumed = [];
+    for (let i = 0; i < m; i++) {
+        let shape = items[i].shape;
+        /* An edge consumed by trims from both sides means the offset collapsed
+           across it (narrow channel, collapsed hole, offset past the medial axis) */
+        if (shape instanceof Flatten.Segment) {
+            let tangent = shape.tangentInStart();
+            let sStart = startTrim[i] === undefined ? 0 :
+                new Flatten.Vector(shape.start, startTrim[i]).dot(tangent);
+            let sEnd = endTrim[i] === undefined ? shape.length :
+                new Flatten.Vector(shape.start, endTrim[i]).dot(tangent);
+            if (!Flatten.Utils.LT(sStart, sEnd)) {
+                consumed.push(i);
+                continue;
+            }
+        }
+        if (startTrim[i] !== undefined) shape = setShapeStart(shape, startTrim[i]);
+        if (endTrim[i] !== undefined) shape = setShapeEnd(shape, endTrim[i]);
+        shapes.push(shape, ...joinShapes[i]);
+    }
+    if (consumed.length > 0) {
+        return {consumed};
+    }
+    /* Drop degenerate zero-length shapes that may appear on exact collapses */
+    shapes = shapes.filter(shape => !Flatten.Utils.EQ_0(shape.length));
+    return {shapes};
+}
+
+/**
+ * Build the raw offset loop of a single face as an array of shapes (Segments and Arcs).
+ * delta is the signed displacement along the left normal of every edge.
+ * Returns null when the loop collapses completely
+ */
+function offsetFaceLoop(face, delta, join, miterLimit, segments, srcPolygon) {
+    let items = buildOffsetItems(face, delta);
+    if (items.length === 0) return null;
+
+    /* Iterate: edges consumed by trims or sunk inside the offset region are
+       removed and the loop is re-stitched between the survivors */
+    let cleanupMode = false;
+    while (true) {
+        let {shapes, consumed} = buildLoopShapes(items, delta, join, miterLimit, segments);
+        if (consumed !== undefined) {
+            cleanupMode = true;
+        } else if (cleanupMode) {
+            /* Remove offset edges that sunk inside the offset region:
+               their middle is closer to the source boundary than |delta| */
+            consumed = [];
+            for (let i = 0; i < items.length; i++) {
+                let middle = items[i].shape.middle();
+                let dist = Flatten.Distance.point2polygon(middle, srcPolygon)[0];
+                if (Flatten.Utils.LT(dist, Math.abs(delta))) {
+                    consumed.push(i);
+                }
+            }
+            if (consumed.length === 0) {
+                return shapes.length > 0 ? shapes : null;
+            }
+        } else {
+            return shapes.length > 0 ? shapes : null;
+        }
+        let removed = new Set(consumed);
+        items = items.filter((item, i) => !removed.has(i));
+        if (items.length < 2) return null;
+    }
+}
 
 /**
  * Class representing a polygon.<br/>
@@ -432,6 +678,122 @@ export class Polygon {
         let multiline = new Multiline([line]);
         return this.cut(multiline);
     }
+
+    /**
+     * Offset the polygon boundary by a constant distance, like a laser-cutter
+     * kerf compensation. Every edge is shifted along its normal and neighboring
+     * offset edges are joined at vertices. <br/>
+     * Positive distance expands the polygon (outer faces grow, holes shrink),
+     * negative distance shrinks it (outer faces shrink, holes grow).
+     * Zero distance returns a geometrically equal new polygon. <br/>
+     * When the offset consumes the whole polygon (e.g. a hole grows over its
+     * island), an empty polygon is returned.
+     * @param {number} distance - offset distance: > 0 to expand, < 0 to shrink
+     * @param {Object} [options] - offset options
+     * @param {string} [options.join="round"] - join type at convex corners: "round" | "miter" | "bevel"
+     * @param {number} [options.miterLimit=4] - max miter length as a multiple of |distance|, otherwise bevel
+     * @param {number} [options.segments=8] - number of chords per 90 degrees of a round join
+     * @returns {Polygon}
+     */
+    offset(distance, options = {}) {
+        let {join = "round", miterLimit = 4, segments = 8} = options;
+
+        if (typeof distance !== "number" || !Number.isFinite(distance)) {
+            throw new Error(`invalid distance: ${distance}`);
+        }
+        if (!OFFSET_JOINS.includes(join)) {
+            throw new Error(`unknown join type: ${join}`);
+        }
+        if (typeof segments !== "number" || !Number.isFinite(segments) || segments < 1) {
+            throw new Error(`invalid segments: ${segments}`);
+        }
+        if (Flatten.Utils.EQ_0(distance)) {
+            return this.clone();
+        }
+        if (this.isEmpty()) {
+            return new Polygon();
+        }
+
+        /* Orientation of the outer faces: orientation of the largest face */
+        let dominant = ORIENTATION.NOT_ORIENTABLE;
+        let maxArea = 0;
+        for (let face of this.faces) {
+            let area = Math.abs(face.signedArea());
+            if (area > maxArea) {
+                maxArea = area;
+                dominant = face.orientation();
+            }
+        }
+
+        /* With consistent orientation the material is always on the left of every
+           edge, so a single signed displacement works for outer faces and holes */
+        let delta = -distance;
+
+        /* Build raw offset loop for every face; drop loops that collapsed or flipped */
+        let loops = [];
+        for (let face of this.faces) {
+            let shapes = offsetFaceLoop(face, delta, join, miterLimit, segments, this);
+            if (shapes === null) continue;
+            let loopPolygon = new Polygon(shapes);
+            if (loopPolygon.isEmpty()) continue;
+            let loopFace = [...loopPolygon.faces][0];
+            let signedArea = loopFace.signedArea();
+            if (Flatten.Utils.EQ_0(signedArea)) continue;                    // collapsed to zero area
+            if (Math.sign(signedArea) !== Math.sign(face.signedArea())) continue;   // flipped: collapsed
+            loops.push({polygon: loopPolygon, outer: face.orientation() === dominant});
+        }
+
+        let outerLoops = loops.filter(loop => loop.outer);
+        let holeLoops = loops.filter(loop => !loop.outer);
+
+        /* No outer boundary survived: the offset consumed the whole polygon */
+        if (outerLoops.length === 0) {
+            return new Polygon();
+        }
+
+        /* Drop outer loops swallowed by a grown hole */
+        outerLoops = outerLoops.filter(outer =>
+            !holeLoops.some(hole => hole.polygon.contains(outer.polygon.vertices[0])));
+        if (outerLoops.length === 0) {
+            return new Polygon();
+        }
+        /* Drop holes that no longer lay inside any outer loop */
+        holeLoops = holeLoops.filter(hole =>
+            outerLoops.some(outer => outer.polygon.contains(hole.polygon.vertices[0])));
+
+        let newPolygon = new Polygon();
+        for (let loop of [...outerLoops, ...holeLoops]) {
+            for (let face of loop.polygon.faces) {
+                newPolygon.addFace(face.shapes);
+            }
+        }
+
+        /* Clean possible self-intersections of the raw offset (e.g. small loops
+           appearing when opposite walls of a narrow channel expand into each other)
+           with a single boolean unify */
+        if (!newPolygon.isValid()) {
+            try {
+                let cleaned = BooleanOperations.unify(newPolygon, newPolygon.clone());
+                if (!cleaned.isEmpty()) {
+                    let filtered = new Polygon();
+                    for (let face of cleaned.faces) {
+                        if (!Flatten.Utils.EQ_0(face.signedArea()) &&
+                            face.orientation() !== ORIENTATION.NOT_ORIENTABLE) {
+                            filtered.addFace(face.shapes);
+                        }
+                    }
+                    if (!filtered.isEmpty()) {
+                        newPolygon = filtered;
+                    }
+                }
+            } catch (e) {
+                /* keep the raw offset when the boolean cleanup cannot complete */
+            }
+        }
+
+        return newPolygon;
+    }
+
 
     /**
      * Returns the first found edge of polygon that contains given point

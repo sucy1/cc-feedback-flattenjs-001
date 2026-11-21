@@ -555,6 +555,7 @@ declare namespace Flatten {
         removeEndVertex(edge: Edge): void;
         cut(multiline: Multiline): Polygon;
         cutWithLine(line: Line): Polygon;
+        offset(distance: number, options?: {join?: "round" | "miter" | "bevel", miterLimit?: number, segments?: number}): Polygon;
         findEdgeByPoint(pt: Point): PolygonEdge | undefined;
         splitToIslands() : Polygon[];
         rearrange() : Polygon;
